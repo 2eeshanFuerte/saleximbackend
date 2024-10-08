@@ -1,0 +1,144 @@
+const express = require('express');
+const ExportData = require('../models/exports'); // Assuming this is the model for ExportData
+const Shipment = require('../models/shipment'); // Updated model for Shipment
+const aggregationRouter = express.Router();
+
+// Helper functions (existing)
+const calculateFetchedData = (monthWiseShipments) => {
+    return monthWiseShipments.reduce((total, shipment) => total + shipment.count, 0);
+};
+
+const getContinent = (country) => {
+    return countryToContinent[country.toUpperCase()] || 'Unknown';
+};
+
+// POST endpoint to aggregate and store shipment data
+aggregationRouter.post('/api/aggregateShipmentData', async (req, res) => {
+    try {
+        const aggregatedData = await ExportData.aggregate([
+            {
+                $addFields: {
+                    month: {
+                        $dateToString: {
+                            format: "%Y-%m",
+                            date: {
+                                $dateFromString: { dateString: { $concat: [{ $arrayElemAt: [{ $split: ["$sbDate", "-"] }, 2] }, "-", { $arrayElemAt: [{ $split: ["$sbDate", "-"] }, 1] }, "-01"] } }
+                            }
+                        }
+                    },
+                    chapterCode: {
+                        $substr: ["$ritcCode", 0, 2]
+                    }
+                }
+            },
+            {
+                $group: {
+                    _id: {
+                        country: '$countryOfDestination',
+                        month: '$month',
+                        chapterCode: '$chapterCode',
+                        pod: '$portOfDischarge'
+                    },
+                    count: { $sum: 1 }
+                }
+            },
+            {
+                $group: {
+                    _id: '$_id.country',
+                    monthWiseShipments: {
+                        $push: {
+                            month: '$_id.month',
+                            count: '$count'
+                        }
+                    },
+                    topExportPODs: {
+                        $push: {
+                            pod: '$_id.pod',
+                            count: '$count'
+                        }
+                    },
+                    chapterCodeCounts: {
+                        $push: {
+                            chapterCode: '$_id.chapterCode',
+                            month: '$_id.month',
+                            count: '$count'
+                        }
+                    }
+                }
+            },
+            {
+                $project: {
+                    country: '$_id',
+                    monthWiseShipments: 1,
+                    topExportPODs: 1,
+                    chapterCodeCounts: 1
+                }
+            }
+        ]);
+
+        // Helper function to combine month-wise shipment data
+        const combineMonthWiseShipments = (monthWiseShipments) => {
+            const monthMap = new Map();
+            monthWiseShipments.forEach(({ month, count }) => {
+                if (monthMap.has(month)) {
+                    monthMap.set(month, monthMap.get(month) + count);
+                } else {
+                    monthMap.set(month, count);
+                }
+            });
+            return Array.from(monthMap.entries()).map(([month, count]) => ({ month, count }));
+        };
+
+        // Helper function to combine POD data
+        const combineTopExportPODs = (topExportPODs) => {
+            const podMap = new Map();
+            topExportPODs.forEach(({ pod, count }) => {
+                if (podMap.has(pod)) {
+                    podMap.set(pod, podMap.get(pod) + count);
+                } else {
+                    podMap.set(pod, count);
+                }
+            });
+            return Array.from(podMap.entries()).map(([pod, count]) => ({ pod, count }));
+        };
+
+        // Calculate fetchedData and percentage for topExportPODs
+        const shipmentData = aggregatedData.map(data => {
+            const monthWiseShipments = combineMonthWiseShipments(data.monthWiseShipments).sort((a, b) => new Date(a.month) - new Date(b.month));
+            const topExportPODs = combineTopExportPODs(data.topExportPODs);
+            const fetchedData = calculateFetchedData(monthWiseShipments);
+            const totalCount = topExportPODs.reduce((acc, pod) => acc + pod.count, 0);
+            const topExportPODsWithPercentage = topExportPODs.map(pod => ({
+                ...pod,
+                percentage: totalCount > 0 ? ((pod.count / totalCount) * 100).toFixed(2) : '0.00'
+            }));
+
+            // Combine chapter code counts
+            const chapterCodeCounts = data.chapterCodeCounts.reduce((acc, { chapterCode, month, count }) => {
+                if (!acc[chapterCode]) {
+                    acc[chapterCode] = {};
+                }
+                acc[chapterCode][month] = count;
+                return acc;
+            }, {});
+
+            return {
+                country: data.country,
+                monthWiseShipments,
+                chapterCodeCounts,
+                fetchedData,
+                topExportPODs: topExportPODsWithPercentage
+            };
+        });
+
+        // Insert the aggregated data into Shipment collection
+        await Shipment.insertMany(shipmentData);
+
+        res.status(200).send({ message: 'Aggregation and insertion completed successfully.' });
+    } catch (error) {
+        console.error('Error aggregating and storing shipment data:', error);
+        res.status(500).send({ message: 'An error occurred during aggregation.' });
+    }
+});
+
+module.exports = aggregationRouter;
